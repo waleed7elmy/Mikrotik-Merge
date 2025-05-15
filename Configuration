@@ -1,0 +1,111 @@
+##Merge Mikrotik WAN Interfaces
+
+###LAN Ports Ether 3.4.5
+
+/ip settings set allow-fast-path=no
+
+
+#make Bridge for LAN
+
+/interface bridge add admin-mac=FF:FF:FF:FF:FF:FF auto-mac=no name=bridge
+
+
+#add port to bridge 
+/interface bridge port add bridge=bridge ingress-filtering=no interface=ether3
+/interface bridge port add bridge=bridge ingress-filtering=no interface=ether4
+/interface bridge port add bridge=bridge ingress-filtering=no interface=ether5
+
+
+#make list for WAN and LAN
+/interface list add name=WAN
+/interface list add name=LAN
+
+#add port to list
+/interface list member add interface=bridge list=LAN
+/interface list member add interface=ether1 list=WAN
+/interface list member add interface=ether2 list=WAN
+#/interface bridge port add bridge=bridge ingress-filtering=no interface=ether6
+#/interface bridge port add bridge=bridge ingress-filtering=no interface=ether7
+#/interface bridge port add bridge=bridge ingress-filtering=no interface=ether8
+#/interface bridge port add bridge=bridge ingress-filtering=no interface=sfp-sfpplus1
+
+
+
+#set IP For LAN Bridge 
+/ip address add address=192.168.88.1/24 interface=bridge network=192.168.88.0 
+#set DNS for LAN Bridge
+/ip dns static add address=192.168.88.1 name=router.lan 
+
+
+#set DHCP for LAN Bridge
+/ip pool add name=pool1 ranges=192.168.88.10-192.168.88.254
+/ip dhcp-server add address-pool=pool1 interface=bridge name=dhcp1
+/ip dhcp-server network add address=192.168.88.0/24 dns-server=192.168.88.1 gateway=192.168.88.1
+
+/ip dhcp-client add interface=ether1 add-default-route=no script=":if (\$bound=1) do={\r\
+    \n    /ip/route/set [find where comment=\"ISP1\"] gateway=\$\"gateway-address\"\r\
+    \n}\r\
+    \n\r\
+    \n/ip/firewall/connection/remove [find connection-mark=\"ISP1_conn\"]\r\
+    \n/ip/firewall/connection/remove [find connection-mark=\"ISP2_conn\"]\r\
+    \n" use-peer-dns=no use-peer-ntp=no
+/ip dhcp-client add interface=ether2 add-default-route=no script=":if (\$bound=1) do={\r\
+    \n    /ip/route/set [find where comment=\"ISP2\"] gateway=\$\"gateway-address\"\r\
+    \n}\r\
+    \n\r\
+    \n/ip/firewall/connection/remove [find connection-mark=\"ISP1_conn\"]\r\
+    \n/ip/firewall/connection/remove [find connection-mark=\"ISP2_conn\"]" use-peer-dns=no use-peer-ntp=no
+
+
+#make routing table for ISP1
+/routing table add fib name=to_ISP1
+#make routing table for ISP2
+/routing table add fib name=to_ISP2
+
+/ip route
+# recursive routes for ECMP default gateways, dst-address are public DNS servers
+add distance=1 dst-address=9.9.9.9/32 gateway=ether1 scope=10 target-scope=10 comment=ISP1
+add distance=1 dst-address=8.26.56.26/32 gateway=ether2 scope=10 target-scope=10 comment=ISP2
+
+# ECMP default gateways
+add check-gateway=ping distance=1 dst-address=0.0.0.0/0 gateway=9.9.9.9 scope=10 target-scope=11
+add check-gateway=ping distance=1 dst-address=0.0.0.0/0 gateway=8.26.56.26 scope=10 target-scope=11
+
+# recursive routes for default gateways, dst-address are public DNS servers
+add dst-address=64.6.64.6/32 gateway=ether1 scope=10 comment="ISP1"
+add dst-address=208.67.220.220/32 gateway=ether1 scope=10 comment="ISP1"
+add dst-address=208.67.222.222/32 gateway=ether2 scope=10 comment="ISP2"
+add dst-address=64.6.65.6/32 gateway=ether2 scope=10 comment="ISP2"
+
+# load-balanced w/ auto failover default gateways
+add check-gateway=ping distance=1 dst-address=0.0.0.0/0 gateway=64.6.64.6 routing-table=to_ISP1 scope=10 target-scope=11
+add check-gateway=ping distance=2 dst-address=0.0.0.0/0 gateway=64.6.65.6 routing-table=to_ISP1 scope=10 target-scope=11
+add check-gateway=ping distance=1 dst-address=0.0.0.0/0 gateway=208.67.222.222 routing-table=to_ISP2 scope=10 target-scope=11
+add check-gateway=ping distance=2 dst-address=0.0.0.0/0 gateway=208.67.220.220 routing-table=to_ISP2 scope=10 target-scope=11
+
+#make local address list
+/ip firewall address-list add address=192.168.88.0/24 list=local
+
+#make mangle for bridge access
+/ip firewall mangle
+add action=accept chain=prerouting comment="bridge access" dst-address-list=local in-interface-list=LAN
+
+# WAN to LAN
+add action=mark-connection chain=prerouting connection-mark=no-mark connection-state=established,related in-interface=ether1 new-connection-mark=ISP1_conn \
+    passthrough=yes
+add action=mark-connection chain=prerouting connection-mark=no-mark connection-state=established,related in-interface=ether2 new-connection-mark=ISP2_conn \
+    passthrough=yes
+    
+# PCC mangles    
+add action=mark-connection chain=prerouting connection-mark=no-mark dst-address-list=!local dst-address-type=!local in-interface-list=LAN new-connection-mark=ISP1_conn passthrough=yes per-connection-classifier=both-addresses-and-ports:2/0
+add action=mark-connection chain=prerouting connection-mark=no-mark dst-address-list=!local dst-address-type=!local in-interface-list=LAN new-connection-mark=ISP2_conn passthrough=yes per-connection-classifier=both-addresses-and-ports:2/1
+    
+    
+add action=mark-routing chain=prerouting connection-mark=ISP1_conn in-interface-list=LAN new-routing-mark=to_ISP1 passthrough=yes
+add action=mark-routing chain=prerouting connection-mark=ISP2_conn in-interface-list=LAN new-routing-mark=to_ISP2 passthrough=yes
+
+add action=mark-routing chain=output connection-mark=ISP1_conn dst-address-list=!local new-routing-mark=to_ISP1 passthrough=yes
+add action=mark-routing chain=output connection-mark=ISP2_conn dst-address-list=!local new-routing-mark=to_ISP2 passthrough=yes
+
+# masquerade
+/ip firewall nat add action=masquerade chain=srcnat ipsec-policy=out,none out-interface-list=WAN
